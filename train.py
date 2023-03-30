@@ -1,4 +1,5 @@
 import math
+import psutil 
 import mlflow
 import torch
 import ray
@@ -17,6 +18,8 @@ from ray.tune import CLIReporter
 from ray.tune.schedulers import ASHAScheduler, PopulationBasedTraining
 from ray.tune.integration.pytorch_lightning import TuneReportCallback, TuneReportCheckpointCallback
 from ray.tune.integration.mlflow import mlflow_mixin
+
+ray.init()
 
 class LightningMNISTClassifier(pl.LightningModule):
 
@@ -98,10 +101,10 @@ class LightningMNISTClassifier(pl.LightningModule):
             mnist_train, [55000, 5000])
 
     def train_dataloader(self):
-        return DataLoader(self.mnist_train, batch_size=int(self.batch_size), num_workers=2)
+        return DataLoader(self.mnist_train, batch_size=int(self.batch_size), num_workers=4)
 
     def val_dataloader(self):
-        return DataLoader(self.mnist_val, batch_size=int(self.batch_size), num_workers=2)
+        return DataLoader(self.mnist_val, batch_size=int(self.batch_size), num_workers=4)
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
@@ -124,17 +127,17 @@ def train_mnist_tune(config, num_epochs=5, num_gpus=0, data_dir="~/data"):
                 on="validation_end")
         ])
     trainer.fit(model)
-    mlflow.pytorch.save_model(model, 'model')
+    mlflow.pytorch.log_model(model, 'model')
 
-def tune_mnist(num_samples=5, num_epochs=5, gpus_per_trial=0, data_dir="~/data"):
+def tune_mnist(num_samples=4, num_epochs=5, gpus_per_trial=0, data_dir="~/data"):
     
     config = {
         "layer_1_size": tune.choice([16, 32, 64]),
         "layer_2_size": tune.choice([32, 64, 128]),
         "lr": tune.loguniform(1e-4, 1e-1),
-        "batch_size": tune.choice([32, 64, 128]),
+        "batch_size": tune.choice([32, 64]),
         "mlflow": {
-            "experiment_name": "test",
+            "experiment_name": "ray-tuning",
             "tracking_uri": mlflow.get_tracking_uri()
         }
     }
@@ -175,4 +178,5 @@ def tune_mnist(num_samples=5, num_epochs=5, gpus_per_trial=0, data_dir="~/data")
 
     print("Best hyperparameters found were: ", results.get_best_result().config)
 
+mlflow.set_experiment("ray-tuning")
 tune_mnist()
