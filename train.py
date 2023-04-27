@@ -101,10 +101,10 @@ class LightningMNISTClassifier(pl.LightningModule):
             mnist_train, [55000, 5000])
 
     def train_dataloader(self):
-        return DataLoader(self.mnist_train, batch_size=int(self.batch_size), num_workers=4)
+        return DataLoader(self.mnist_train, batch_size=int(self.batch_size), num_workers=1)
 
     def val_dataloader(self):
-        return DataLoader(self.mnist_val, batch_size=int(self.batch_size), num_workers=4)
+        return DataLoader(self.mnist_val, batch_size=int(self.batch_size), num_workers=1)
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
