@@ -1,25 +1,29 @@
-import math
-import psutil 
 import mlflow
 import torch
 import ray
 import os
+import argparse
 import ray.util
 import pytorch_lightning as pl
+from ray import tune
 from filelock import FileLock
 from torch.utils.data import DataLoader, random_split
 from torch.nn import functional as F
 from torchvision.datasets import MNIST
 from torchvision import transforms
-from pytorch_lightning.loggers import TensorBoardLogger
 from ray import air, tune
-from ray.air import session
-from ray.tune import CLIReporter
-from ray.tune.schedulers import ASHAScheduler, PopulationBasedTraining
-from ray.tune.integration.pytorch_lightning import TuneReportCallback, TuneReportCheckpointCallback
-from ray.tune.integration.mlflow import mlflow_mixin
+from ray.train import CheckpointConfig
+from ray.tune.schedulers import ASHAScheduler
+from ray.air.integrations.mlflow import MLflowLoggerCallback
+from ray.train.lightning import (
+    RayDDPStrategy,
+    RayTrainReportCallback,
+)
 
-ray.init()
+print("Initializing Ray Cluster...")
+service_host = os.environ["RAY_HEAD_SERVICE_HOST"]
+service_port = os.environ["RAY_HEAD_SERVICE_PORT"]
+ray.init(f"ray://{service_host}:{service_port}")
 
 class LightningMNISTClassifier(pl.LightningModule):
 
@@ -32,15 +36,13 @@ class LightningMNISTClassifier(pl.LightningModule):
         self.layer_2_size = config["layer_2_size"]
         self.lr = config["lr"]
         self.batch_size = config["batch_size"]
-        mlflow.log_param("layer_1_size", self.layer_1_size)
-        mlflow.log_param("layer_2_size", self.layer_2_size)
-        mlflow.log_param("lr", self.lr)
-        mlflow.log_param("batch_size", self.batch_size)
 
         # mnist images are (1, 28, 28) (channels, width, height)
         self.layer_1 = torch.nn.Linear(28 * 28, self.layer_1_size)
         self.layer_2 = torch.nn.Linear(self.layer_1_size, self.layer_2_size)
         self.layer_3 = torch.nn.Linear(self.layer_2_size, 10)
+        self.eval_loss = []
+        self.eval_accuracy = []
 
     def forward(self, x):
         batch_size, channels, width, height = x.size()
@@ -76,15 +78,17 @@ class LightningMNISTClassifier(pl.LightningModule):
         logits = self.forward(x)
         loss = self.cross_entropy_loss(logits, y)
         accuracy = self.accuracy(logits, y)
+        self.eval_loss.append(loss)
+        self.eval_accuracy.append(accuracy)
         return {"val_loss": loss, "val_accuracy": accuracy}
 
-    def validation_epoch_end(self, outputs):
-        avg_loss = torch.stack([x["val_loss"] for x in outputs]).mean()
-        avg_acc = torch.stack([x["val_accuracy"] for x in outputs]).mean()
-        mlflow.log_metric("val_loss", avg_loss, step=self.current_epoch)
-        mlflow.log_metric("val_accuracy", avg_acc, step=self.current_epoch)
+    def on_validation_epoch_end(self):
+        avg_loss = torch.stack(self.eval_loss).mean()
+        avg_acc = torch.stack(self.eval_accuracy).mean()
         self.log("val_loss", avg_loss)
         self.log("val_accuracy", avg_acc)
+        self.eval_loss.clear()
+        self.eval_accuracy.clear()
 
     @staticmethod
     def download_data(data_dir):
@@ -101,45 +105,35 @@ class LightningMNISTClassifier(pl.LightningModule):
             mnist_train, [55000, 5000])
 
     def train_dataloader(self):
-        return DataLoader(self.mnist_train, batch_size=int(self.batch_size), num_workers=1)
+        return DataLoader(self.mnist_train, batch_size=int(self.batch_size), num_workers=2)
 
     def val_dataloader(self):
-        return DataLoader(self.mnist_val, batch_size=int(self.batch_size), num_workers=1)
+        return DataLoader(self.mnist_val, batch_size=int(self.batch_size), num_workers=2)
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
         return optimizer
 
-@mlflow_mixin
-def train_mnist_tune(config, num_epochs=5, num_gpus=0, data_dir="~/data"):
+def train_mnist_tune(config, num_epochs=5, data_dir="~/data"):
     data_dir = os.path.expanduser(data_dir)
     model = LightningMNISTClassifier(config, data_dir)
     trainer = pl.Trainer(
         max_epochs=num_epochs,
-        gpus=math.ceil(num_gpus),
+        devices="auto",
+        accelerator="auto",
+        strategy=RayDDPStrategy(),
         enable_progress_bar=False,
-        callbacks=[
-            TuneReportCallback(
-                {
-                    "loss": "val_loss",
-                    "mean_accuracy": "val_accuracy"
-                },
-                on="validation_end")
-        ])
+        callbacks=[RayTrainReportCallback()]
+    )
     trainer.fit(model)
-    mlflow.pytorch.log_model(model, 'model')
+    mlflow.pytorch.log_model(model, "model")
 
-def tune_mnist(num_samples=4, num_epochs=5, gpus_per_trial=0, data_dir="~/data"):
-    
+def tune_mnist(storage_path, num_epochs, num_trials, cpus_per_trial, gpus_per_trial, data_dir="~/data"):
     config = {
         "layer_1_size": tune.choice([16, 32, 64]),
         "layer_2_size": tune.choice([32, 64, 128]),
         "lr": tune.loguniform(1e-4, 1e-1),
-        "batch_size": tune.choice([32, 64]),
-        "mlflow": {
-            "experiment_name": "ray-tuning",
-            "tracking_uri": mlflow.get_tracking_uri()
-        }
+        "batch_size": tune.choice([32, 64])
     }
 
     scheduler = ASHAScheduler(
@@ -147,15 +141,8 @@ def tune_mnist(num_samples=4, num_epochs=5, gpus_per_trial=0, data_dir="~/data")
         grace_period=1,
         reduction_factor=2)
 
-    reporter = CLIReporter(
-        parameter_columns=["layer_1_size", "layer_2_size", "lr", "batch_size"],
-        metric_columns=["loss", "mean_accuracy", "training_iteration"])
-
-    train_fn_with_parameters = tune.with_parameters(train_mnist_tune,
-                                                    num_epochs=num_epochs,
-                                                    num_gpus=gpus_per_trial,
-                                                    data_dir=data_dir)
-    resources_per_trial = {"cpu": 1, "gpu": gpus_per_trial}
+    train_fn_with_parameters = tune.with_parameters(train_mnist_tune,num_epochs=num_epochs,data_dir=data_dir)
+    resources_per_trial = {"cpu": cpus_per_trial, "gpu": gpus_per_trial}
     
     tuner = tune.Tuner(
         tune.with_resources(
@@ -163,14 +150,16 @@ def tune_mnist(num_samples=4, num_epochs=5, gpus_per_trial=0, data_dir="~/data")
             resources=resources_per_trial
         ),
         tune_config=tune.TuneConfig(
-            metric="loss",
+            metric="val_loss",
             mode="min",
             scheduler=scheduler,
-            num_samples=num_samples,
+            num_samples=num_trials,
         ),
         run_config=air.RunConfig(
             name="tune_mnist_asha",
-            progress_reporter=reporter,
+            storage_path=storage_path,
+            checkpoint_config=CheckpointConfig(num_to_keep=2, checkpoint_score_attribute="val_loss", checkpoint_score_order="min"),
+            callbacks=[MLflowLoggerCallback(experiment_name="mnist-tuning", save_artifact=True)]
         ),
         param_space=config,
     )
@@ -178,5 +167,12 @@ def tune_mnist(num_samples=4, num_epochs=5, gpus_per_trial=0, data_dir="~/data")
 
     print("Best hyperparameters found were: ", results.get_best_result().config)
 
-mlflow.set_experiment("ray-tuning")
-tune_mnist()
+parser = argparse.ArgumentParser(description="Hyperparameter tuning an MNIST model using Ray and Pytorch Lightning")
+parser.add_argument("--storage_path", required=False, default="/mnt/data/ray-results", type=str)
+parser.add_argument("--num_epochs", required=False, default=5, type=int)
+parser.add_argument("--num_trials", required=False, default=4, type=int)
+parser.add_argument("--cpus_per_trial", required=False, default=2, type=int)
+parser.add_argument("--gpus_per_trial", required=False, default=1, type=int)
+args = parser.parse_args()
+
+tune_mnist(storage_path=args.storage_path, num_epochs=args.num_epochs, num_trials=args.num_trials, cpus_per_trial=args.cpus_per_trial, gpus_per_trial=args.gpus_per_trial)
